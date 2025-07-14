@@ -1,0 +1,417 @@
+#include <Arduino.h>      // Required for PlatformIO/Arduino IDE compilation
+#include <Wire.h>         // Required for I2C communication with MCP23017
+#include <SoftwareSerial.h> // REQUIRED for SoftwareSerial communication
+
+/****************************************************************************************
+ * GPIO PIN MAPPING FOR YOUR BOARD (IMPORTANT: ADJUST THESE!)
+ *
+ * This code is designed to be flexible, but you MUST adjust these pin definitions
+ * to match the specific ATtiny microcontroller or standard Arduino board
+ * you are using for testing.
+ *
+ * This version uses SoftwareSerial for RS-485 communication, allowing HardwareSerial
+ * to be used for debugging messages to your computer. This requires at least 5 GPIO pins:
+ * - 2 for SoftwareSerial (RX, TX) for RS-485
+ * - 2 for ST3485DE control (DE, ~RE)
+ * - 1 for MCP23017 INT
+ * - 1 for LED (if used)
+ *
+ * Note: If using a board like ATtiny85 with limited pins or only one UART,
+ * you might not be able to have separate debug output and RS-485 communication.
+ * In such cases, you might need to alternate between debugging output and RS-485
+ * communication, or use an LED blink pattern for status indications.
+ *
+ * This code assumes you are using an **ST3485DE** RS-485 transceiver, which has
+ * separate DE (Driver Enable, Active HIGH) and ~RE (Receiver Enable, Active LOW) pins.
+ *
+ * --------------------------------------------------------------------------------------
+ * Example for a standard Arduino Uno/Nano:
+ * --------------------------------------------------------------------------------------
+ * #define RS485_RX_PIN    10  // Connect to ST3485DE RO (RO from ST3485DE to this pin)
+ * #define RS485_TX_PIN    11  // Connect to ST3485DE DI (DI from this pin to ST3485DE)
+ * #define RS485_DE_PIN    2   // Connect to ST3485DE DE pin
+ * #define RS485_NRE_PIN   3   // Connect to ST3485DE ~RE pin
+ * #define MCP_INT_PIN     4   // Connect to MCP23017 INT (MUST be an external interrupt-capable pin, e.g., D2 or D3 on Uno/Nano)
+ * #define LED_PIN         13  // Built-in LED on Arduino Uno/Nano
+ *
+ * (HardwareSerial `Serial` will use digital pins 0 and 1 for debug output.)
+ *
+ * --------------------------------------------------------------------------------------
+ * Example for ATtiny (like ATtiny84, assuming specific core/configuration):
+ * --------------------------------------------------------------------------------------
+ * // Consult your ATtiny core documentation for actual pin mappings (e.g., PB0, PA7, etc.)
+ * // and available HardwareSerial/SoftwareSerial capabilities.
+ *
+ * #define RS485_DE_PIN    PB0 // Connect to ST3485DE DE pin
+ * #define RS485_NRE_PIN   PB1 // Connect to ST3485DE ~RE pin
+ * #define MCP_INT_PIN     PB2 // Connect to MCP23017 INT (must be an interrupt-capable pin on ATtiny)
+ * #define LED_PIN         PB5 // Example for ATtiny85, or PA7 for ATtiny84 (check your board)
+ * #define RS485_RX_PIN    PB3 // Connect to ST3485DE RO (for SoftwareSerial)
+ * #define RS485_TX_PIN    PB4 // Connect to ST3485DE DI (for SoftwareSerial)
+ *
+ * // If using ATtiny's hardware UART, these might be PA0/PA1 or similar.
+ * // In that case, you would use `Serial.begin()` for the ATtiny's HardwareSerial
+ * // and manage pin usage accordingly.
+ *
+ ****************************************************************************************/
+
+// --- ADJUST THESE DEFINITIONS FOR YOUR SPECIFIC BOARD ---
+#define RS485_RX_PIN    10 // Connect to ST3485DE RO (RO from ST3485DE to this pin)
+#define RS485_TX_PIN    11 // Connect to ST3485DE DI (DI from this pin to ST3485DE)
+#define RS485_DE_PIN    2  // Connect to ST3485DE DE pin
+#define RS485_NRE_PIN   3  // Connect to ST3485DE ~RE pin
+#define MCP_INT_PIN     4  // Connect to MCP23017 INT
+#define LED_PIN         13 // Built-in LED
+
+// --- RS-485 Baud Rate (Must match ESP32 Master) ---
+#define RS485_BAUD_RATE 57600
+
+// Initialize SoftwareSerial for RS-485 communication on specified pins
+SoftwareSerial myRs485Serial(RS485_RX_PIN, RS485_TX_PIN);
+
+// MCP23017 I2C Address (A0, A1, A2 all low)
+#define MCP23017_ADDRESS 0x20
+
+// --- Master (ESP32) -> Slave (ATtiny) Request Types (what this ATtiny listens for) ---
+#define MASTER_POLL_START_BYTE   0xBB
+#define REQ_STATUS_POLL          0x01 // Request for button status data
+#define REQ_DISCOVERY_POLL       0x02 // Request for device presence/ACK
+
+// --- Slave (ATtiny) -> Master (ESP32) Response Types (what this ATtiny sends) ---
+#define RESP_STATUS_DATA         0xAA // Start byte for status data response
+#define RESP_DISCOVERY_ACK       0xCC // Start byte for discovery ACK response
+
+// --- Packet Lengths (Crucial for parsing on both ends) ---
+#define MASTER_REQUEST_PACKET_LENGTH 5 // StartByte + MasterID + RequestType + TargetID + Checksum
+#define SLAVE_STATUS_RESPONSE_LENGTH 5 // StartByte + DeviceID + RawMCPHigh + RawMCPLow + Checksum
+#define SLAVE_ACK_RESPONSE_LENGTH    4 // StartByte + DeviceID + AckType + Checksum
+
+// --- MCP23017 Pin Allocation on THIS Remote Unit ---
+// GPA0-GPA7: Buttons 0-7 (8 pins)
+// GPB0-GPB3: Buttons 8-11 (4 pins)
+// GPB4-GPB7: DIP Switches for Device ID (4 pins)
+
+// --- Global Variables ---
+volatile bool mcpInterruptFlag = false; // Set by ISR; useful for future sleep/wake or debugging.
+uint16_t previousRawMCPInputs = 0xFFFF; // Stores the last *raw* 16-bit state of MCP pins.
+                                        // Initialized to all HIGH (released/DIPs off).
+byte myDeviceID;                        // This unit's unique ID, read from DIP switches on MCP23017
+
+// --- RS-485 Receive Buffer for incoming Master Polls ---
+byte rs485_recv_buffer[MASTER_REQUEST_PACKET_LENGTH];
+byte rs485_recv_index = 0;
+bool rs485_packet_started = false;
+
+// --- LED Blinking Variables (for heartbeat) ---
+unsigned long lastLedToggleTime = 0;
+const unsigned long LED_BLINK_INTERVAL_MS = 1000; // Blink every 1 second (500ms ON, 500ms OFF)
+bool ledState = LOW; // Current state of the LED
+
+
+// --- Function Prototypes ---
+void setupMCP23017();      // Configures the MCP23017
+uint16_t readMCP23017GPIO(); // Reads all 16 pins from MCP23017
+void mcpInterruptISR();    // ISR for the MCP23017's interrupt pin
+void sendStatusResponse(); // Sends the current button status data to the Master
+void sendDiscoveryAck();   // Sends a simple acknowledgment during discovery
+
+
+void setup() {
+  // Initialize HardwareSerial for debugging messages (typically via USB on Arduino)
+  Serial.begin(115200); // Using a higher baud rate for debugging to avoid interference with RS-485
+  // Wait for Serial port to connect (useful for some boards, e.g., ESP32, but often not necessary for Uno/Nano)
+  while (!Serial && millis() < 5000);
+  Serial.println("\n--- ATtiny Slave Starting ---");
+
+  // Initialize I2C bus for communication with MCP23017
+  Wire.begin();
+  Serial.println("I2C Wire library initialized.");
+
+  // --- Configure RS-485 control pins for ST3485DE transceiver ---
+  pinMode(RS485_DE_PIN, OUTPUT);
+  pinMode(RS485_NRE_PIN, OUTPUT);
+  // Set ST3485DE to Receive mode by default: DE LOW, ~RE LOW
+  digitalWrite(RS485_DE_PIN, LOW);
+  digitalWrite(RS485_NRE_PIN, LOW);
+  Serial.println("RS-485 DE/~RE pins configured to Receive mode.");
+
+  // Initialize SoftwareSerial for RS-485 communication
+  myRs485Serial.begin(RS485_BAUD_RATE);
+  Serial.print("SoftwareSerial for RS-485 initialized on RX:");
+  Serial.print(RS485_RX_PIN);
+  Serial.print("/TX:");
+  Serial.print(RS485_TX_PIN);
+  Serial.print(" at ");
+  Serial.print(RS485_BAUD_RATE);
+  Serial.println(" bps.");
+
+
+  // Configure the MCP23017 I/O expander and read its initial state
+  setupMCP23017(); // This function also updates `previousRawMCPInputs` with the power-up state
+  Serial.println("MCP23017 initialized.");
+
+  // Read this unit's unique Device ID from the DIP switches on the MCP23017
+  // (Assumes DIP switches are connected to GPB4-GPB7, active-low pull-ups)
+  byte dipSwitchRaw = (byte)(previousRawMCPInputs >> 12); // Extract bits 12-15 (GPB4-GPB7)
+  myDeviceID = ~dipSwitchRaw & 0x0F; // Invert bits and mask to get a 4-bit ID (0-15)
+  Serial.print("Device ID read from DIP switches: ");
+  Serial.println(myDeviceID);
+  Serial.print("Initial Raw MCP Inputs (for DIP ID calculation): 0b");
+  Serial.println(previousRawMCPInputs, BIN);
+
+  // Attach the external interrupt for the MCP23017's INT pin
+  // Ensure MCP_INT_PIN is connected to an interrupt-capable pin on your board.
+  pinMode(MCP_INT_PIN, INPUT_PULLUP); // Configure pin for interrupt input with internal pull-up
+  attachInterrupt(digitalPinToInterrupt(MCP_INT_PIN), mcpInterruptISR, FALLING); // Trigger ISR on falling edge
+  Serial.print("MCP23017 Interrupt attached to pin ");
+  Serial.println(MCP_INT_PIN);
+
+  // --- Setup LED Pin for Heartbeat ---
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, ledState); // Set initial LED state (LOW = off)
+  Serial.print("LED pin ");
+  Serial.print(LED_PIN);
+  Serial.println(" configured for heartbeat.");
+  Serial.println("--- Setup Complete. Entering loop ---");
+}
+
+void loop() {
+  // Read the current raw state of all 16 MCP23017 pins.
+  // This updates `previousRawMCPInputs` for `sendStatusResponse()`
+  // and implicitly clears any pending interrupt flags on the MCP23017.
+  uint16_t currentRawInputsLoop = readMCP23017GPIO();
+  if (currentRawInputsLoop != previousRawMCPInputs) {
+    Serial.print("MCP input detected change. New state: 0b");
+    Serial.println(currentRawInputsLoop, BIN);
+    previousRawMCPInputs = currentRawInputsLoop; // Update only if there's a change
+  }
+
+
+  // --- RS-485 Data Reception (listening for Master Poll Requests) ---
+  // Continuously check for incoming serial data from the Master ESP32
+  while (myRs485Serial.available()) { // Check SoftwareSerial buffer
+    byte incomingByte = myRs485Serial.read(); // Read byte from RS-485 bus
+    Serial.print("RS485 RX byte: 0x");
+    Serial.println(incomingByte, HEX);
+
+    if (rs485_packet_started) { // If we're already in the middle of receiving a packet
+      rs485_recv_buffer[rs485_recv_index++] = incomingByte; // Store the byte and increment index
+      // Once we have a full Master Request packet (MASTER_REQUEST_PACKET_LENGTH bytes)
+      if (rs485_recv_index >= MASTER_REQUEST_PACKET_LENGTH) {
+        // Verify the packet's Start Byte
+        if (rs485_recv_buffer[0] == MASTER_POLL_START_BYTE) {
+          // Extract packet fields for validation
+          byte masterID = rs485_recv_buffer[1]; // Master's ID
+          byte requestType = rs485_recv_buffer[2];
+          byte targetID = rs485_recv_buffer[3]; // The ID this poll request is for
+          byte receivedChecksum = rs485_recv_buffer[4];
+
+          // Calculate checksum of the received request for verification
+          byte calculatedChecksum = MASTER_POLL_START_BYTE ^ masterID ^ requestType ^ targetID;
+
+          Serial.print("  Received Poll Packet: MasterID="); Serial.print(masterID);
+          Serial.print(", ReqType="); Serial.print(requestType);
+          Serial.print(", TargetID="); Serial.print(targetID);
+          Serial.print(", RxChksum=0x"); Serial.println(receivedChecksum, HEX);
+
+          // Process the request if checksum matches and it's addressed to THIS device
+          if (receivedChecksum == calculatedChecksum) {
+            Serial.println("  Checksum OK.");
+            if (targetID == myDeviceID) { // Is this poll for THIS ATtiny unit?
+              Serial.println("  Poll is for THIS device! Responding...");
+              if (requestType == REQ_STATUS_POLL) {
+                Serial.println("  Requesting Status...");
+                sendStatusResponse(); // Send our current button status
+              } else if (requestType == REQ_DISCOVERY_POLL) {
+                Serial.println("  Requesting Discovery ACK...");
+                sendDiscoveryAck(); // Send simple ACK for discovery
+              } else {
+                Serial.print("  Unknown Request Type: "); Serial.println(requestType);
+              }
+            } else {
+              Serial.print("  Poll is for ID "); Serial.print(targetID); Serial.println(", not us. Ignoring.");
+            }
+          } else {
+            Serial.println("  Checksum MISMATCH! Discarding packet.");
+          }
+        } else {
+          Serial.print("  Sync Error: Expected Start Byte 0x"); Serial.print(MASTER_POLL_START_BYTE, HEX);
+          Serial.print(", Got 0x"); Serial.println(rs485_recv_buffer[0], HEX);
+        }
+        // In any case (valid, invalid, sync error), reset receiver state for the next packet.
+        rs485_recv_index = 0;
+        rs485_packet_started = false;
+      }
+    } else if (incomingByte == MASTER_POLL_START_BYTE) { // Found the start byte of a new Master Poll Request
+      Serial.println("RS485: Poll Start Byte detected (0xBB).");
+      rs485_packet_started = true;
+      rs485_recv_index = 0;
+      rs485_recv_buffer[0] = incomingByte; // Store the start byte
+    } else {
+      // Discard unexpected bytes if not starting a packet
+      Serial.print("RS485: Discarding unexpected byte (not start byte): 0x");
+      Serial.println(incomingByte, HEX);
+    }
+  }
+
+  // --- LED Blinking Logic (Heartbeat when Idle) ---
+  // This runs non-blocking, checking if it's time to toggle the LED.
+  if (millis() - lastLedToggleTime >= LED_BLINK_INTERVAL_MS) {
+    ledState = !ledState; // Toggle LED state (HIGH to LOW, or LOW to HIGH)
+    digitalWrite(LED_PIN, ledState);
+    lastLedToggleTime = millis(); // Reset the timer for the next toggle
+    // Serial.print("LED toggled to "); Serial.println(ledState ? "HIGH" : "LOW"); // Uncomment for verbose LED logging
+  }
+}
+
+// --- MCP23017 Specific Functions ---
+
+// Configures the MCP23017 I/O Expander for its role in this system:
+// - All 16 GPIO pins (GPA0-7, GPB0-7) are set as inputs.
+// - Internal pull-up resistors are enabled for all 16 input pins.
+// - Interrupt-on-change is enabled for all 16 input pins.
+// - The INT output pin is configured to mirror INTA/INTB and be active-low.
+void setupMCP23017() {
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x00); // IODIRA register (GPIO A direction control)
+  Wire.write(0xFF); // Set all GPA pins (0-7) as inputs (1 = input)
+  Wire.endTransmission();
+  Serial.println("MCP23017 IODIRA set to inputs (0xFF).");
+
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x01); // IODIRB register (GPIO B direction control)
+  Wire.write(0xFF); // Set all GPB pins (0-7) as inputs (1 = input)
+  Wire.endTransmission();
+  Serial.println("MCP23017 IODIRB set to inputs (0xFF).");
+
+  // Enable internal pull-up resistors for all 16 input pins (GPA0-7, GPB0-7)
+  // This is crucial for active-low button wiring (button connects pin to GND).
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x0C); // GPPUA register (GPIO A pull-up enable)
+  Wire.write(0xFF); // Enable pull-ups on GPA0-GPA7 (0xFF)
+  Wire.endTransmission();
+  Serial.println("MCP23017 GPPUA pull-ups enabled (0xFF).");
+
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x0D); // GPPUB register (GPIO B pull-up enable)
+  Wire.write(0xFF); // Enable pull-ups on GPB0-GPB7 (0xFF)
+  Wire.endTransmission();
+  Serial.println("MCP23017 GPPUB pull-ups enabled (0xFF).");
+
+  // Configure IOCON register for interrupt behavior
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x0A); // IOCON register
+  // Bit 6 (INT_MIRROR): 1 = INTA and INTB interrupt pins are OR'd together (single INT output from device)
+  // Bit 1 (INTPOL): 0 = Interrupt output is active-low (pulls low when interrupt occurs)
+  Wire.write(0b00100000); // Only INT_MIRROR enabled (0x20)
+  Wire.endTransmission();
+  Serial.println("MCP23017 IOCON configured (INT_MIRROR enabled).");
+
+  // Enable interrupt-on-change for all 16 input pins (buttons and DIP switches)
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x08); // GPINTENA register (Interrupt-on-change enable for GPIO A)
+  Wire.write(0xFF); // Enable interrupt on change for GPA0-GPA7 (0xFF)
+  Wire.endTransmission();
+  Serial.println("MCP23017 GPINTENA interrupts enabled (0xFF).");
+
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x09); // GPINTENB register (Interrupt-on-change enable for GPIO B)
+  Wire.write(0xFF); // Enable interrupt on change for GPB0-GPB7 (0xFF)
+  Wire.endTransmission();
+  Serial.println("MCP23017 GPINTENB interrupts enabled (0xFF).");
+
+  // Perform an initial read of the GPIO registers (GPIOA and GPIOB) to clear any pending interrupts.
+  // This is crucial, as interrupts might be flagged from previous states before setup is complete.
+  previousRawMCPInputs = readMCP23017GPIO();
+  Serial.println("MCP23017 initial GPIO read performed to clear any pending interrupts.");
+}
+
+// Reads the current state of all 16 GPIO pins from the MCP23017.
+// IMPORTANT: Reading these registers (specifically INTCAP or GPIO) automatically
+// clears any pending interrupt flags on the MCP23017, allowing for subsequent interrupts.
+uint16_t readMCP23017GPIO() {
+  Wire.beginTransmission(MCP23017_ADDRESS);
+  Wire.write(0x12); // Address of GPIOA register (Reading this also gets GPIOB next)
+  Wire.endTransmission();
+  Wire.requestFrom(MCP23017_ADDRESS, 2); // Request 2 bytes (GPIOA and GPIOB)
+
+  uint8_t gpioA = Wire.read(); // Read byte for GPIOA (lower 8 bits)
+  uint8_t gpioB = Wire.read(); // Read byte for GPIOB (upper 8 bits)
+
+  return (gpioB << 8) | gpioA; // Combine into a 16-bit value (GPB as high byte, GPA as low byte)
+}
+
+// Interrupt Service Routine (ISR) for the MCP23017's INT pin.
+// This ISR is triggered by the ATtiny's external interrupt when the MCP23017's INT pin
+// goes from HIGH to LOW (due to being configured as active-low output and FALLING mode).
+void mcpInterruptISR() {
+  // In this polling system, the MCP's interrupt helps ensure the ATtiny is awake
+  // if it were in a sleep mode. It's not the direct trigger for RS-485 transmission
+  // in this specific polling model.
+  // The `readMCP23017GPIO()` call in the main loop will continuously clear the MCP's
+  // interrupt flag, so this flag's primary use here is for debugging or future low-power modes.
+  mcpInterruptFlag = true; // Set a volatile flag to indicate an interrupt occurred.
+  // Avoid Serial.print() or complex I2C operations directly within an ISR, as they can cause issues.
+}
+
+// Sends the current 16-bit raw MCP input state to the Master (ESP32) when polled for status.
+void sendStatusResponse() {
+  Serial.println("RS485 TX: Sending Status Response...");
+
+  // Set ST3485DE to Transmit Mode: DE HIGH, ~RE HIGH
+  digitalWrite(RS485_NRE_PIN, HIGH); // Disable Receiver (~RE pin is active LOW)
+  digitalWrite(RS485_DE_PIN, HIGH);  // Enable Driver (DE pin is active HIGH)
+  delay(1); // Short delay to ensure the ST3485DE transceiver is stable in transmit mode
+
+  // Get the freshest raw 16-bit input state from MCP23017 right before sending
+  uint16_t currentRawState = readMCP23017GPIO();
+  Serial.print("  Current Raw State (to send): 0b");
+  Serial.println(currentRawState, BIN);
+
+  byte highByte = (byte)(currentRawState >> 8); // Extract the higher 8 bits (GPB)
+  byte lowByte = (byte)(currentRawState & 0xFF); // Extract the lower 8 bits (GPA)
+
+  // Calculate the checksum for the slave status response packet
+  // Checksum includes Start Byte, Device ID, High Byte, Low Byte
+  byte checksum = RESP_STATUS_DATA ^ myDeviceID ^ highByte ^ lowByte;
+
+  // Transmit the 5-byte status response packet via SoftwareSerial
+  myRs485Serial.write(RESP_STATUS_DATA); // 1. Start byte (0xAA)
+  myRs485Serial.write(myDeviceID);       // 2. This unit's Device ID
+  myRs485Serial.write(highByte);         // 3. Raw MCP input high byte
+  myRs485Serial.write(lowByte);          // 4. Raw MCP input low byte
+  myRs485Serial.write(checksum);         // 5. Checksum
+  myRs485Serial.flush(); // Wait for the entire transmit buffer to empty (ensures packet is sent before switching modes)
+  Serial.println("  Status Response Packet Sent via RS-485.");
+
+  // After transmission, switch ST3485DE back to Receive mode: DE LOW, ~RE LOW
+  digitalWrite(RS485_DE_PIN, LOW);
+  digitalWrite(RS485_NRE_PIN, LOW);
+  Serial.println("RS485 TX: Switched back to Receive mode.");
+}
+
+// Sends a simple acknowledgment (ACK) when polled by the Master for discovery.
+void sendDiscoveryAck() {
+    Serial.println("RS485 TX: Sending Discovery ACK...");
+
+    // Set ST3485DE to Transmit Mode: DE HIGH, ~RE HIGH
+    digitalWrite(RS485_NRE_PIN, HIGH); // Disable Receiver (~RE HIGH)
+    digitalWrite(RS485_DE_PIN, HIGH); // Enable Driver (DE HIGH)
+    delay(1); // Short delay for stability
+
+    byte ackType = 0x01; // Simple ACK type (e.g., "I'm here and ready to talk")
+    byte checksum = RESP_DISCOVERY_ACK ^ myDeviceID ^ ackType; // Calculate checksum for ACK packet
+
+    // Transmit the 4-byte discovery ACK packet via SoftwareSerial
+    myRs485Serial.write(RESP_DISCOVERY_ACK); // Start byte (0xCC)
+    myRs485Serial.write(myDeviceID);         // This unit's Device ID
+    myRs485Serial.write(ackType);            // ACK Type
+    myRs485Serial.write(checksum);           // Checksum
+    myRs485Serial.flush();
+    Serial.println("  Discovery ACK Packet Sent via RS-485.");
+
+    // After transmission, switch ST3485DE back to Receive mode: DE LOW, ~RE LOW
+    digitalWrite(RS485_DE_PIN, LOW);
+    digitalWrite(RS485_NRE_PIN, LOW);
+    Serial.println("RS485 TX: Switched back to Receive mode.");
+}
