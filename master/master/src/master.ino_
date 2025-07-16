@@ -1,0 +1,668 @@
+#include <Arduino.h>
+#include <WiFi.h>   // Required for WiFi.mode() and WiFi.onEvent(), even if not using Wi-Fi
+#include <ETH.h>    // Required for Ethernet library functions
+#include <PubSubClient.h> // Required for MQTT client functionality
+#include <ArduinoJson.h>  // Required for JSON payload creation
+#include <HardwareSerial.h> // Required for ESP32's second UART
+
+// --- Ethernet Configuration for ESP32-ETH01 (LAN8720A) ---
+#define ETH_MDC_PIN    23
+#define ETH_MDIO_PIN   18
+#define ETH_TYPE       ETH_PHY_LAN8720
+#define ETH_CLK_MODE   ETH_CLOCK_GPIO0_IN
+#define ETH_POWER_PIN  16 
+
+// --- Dedicated PHY Reset Pin (Optional, requires board wiring) ---
+// If your ESP32-ETH01 has a specific GPIO connected to the LAN8720A's _nRESET pin,
+// define it here. Common pins found on some boards are GPIO5.
+// If not used/available on your board, leave this line commented out.
+// #define ETH_PHY_RESET_PIN 5 
+
+
+// --- RS-485 Configuration for ST3485DE (using Hardware Serial2) ---
+// !!! IMPORTANT: YOU MUST FIND AND VERIFY THESE PINS ON YOUR BOARD'S SCHEMATIC !!!
+// !!! These are common free UART2 pins, but may differ on your specific ESP32-ETH01 variant.
+#define RS485_RX_PIN     5  // ESP32 GPIO for RS-485 Receive (RO from ST3485DE) - UART2 RX
+#define RS485_TX_PIN     17 // ESP32 GPIO for RS-485 Transmit (DI to ST3485DE) - UART2 TX
+#define RS485_DE_PIN     32 // ESP32 GPIO for ST3485DE DE pin (Driver Enable - Active HIGH)
+#define RS485_NRE_PIN    33 // ESP32 GPIO for ST3485DE ~RE pin (Receiver Enable - Active LOW)
+#define RS485_BAUD_RATE 57600 // Must match slave ATtiny
+
+
+// Use Serial2 for RS-485 communication, remapped to custom pins
+HardwareSerial SerialRS485(2); 
+
+
+// --- Global Flag for Ethernet IP Status ---
+bool ethGotIP = false;
+
+// --- MQTT Configuration ---
+const char* MQTT_HOST = "mqtt.iot";
+const int MQTT_PORT = 1883;
+const char* MQTT_CLIENT_ID = "esp32_buttons";
+const char* MQTT_LWT_TOPIC = "tele/esp32_buttons/LWT";
+const char* MQTT_LWT_MESSAGE_OFFLINE = "Offline";
+const char* MQTT_CMD_RESTART_TOPIC = "cmnd/esp32_buttons/RESTART";
+const char* MQTT_STATUS_TOPIC = "stat/esp32_buttons/STATUS"; // For general status, discovery, and errors
+const char* MQTT_DATA_TOPIC = "sensors/buttons/events"; // For button data
+
+
+WiFiClient ethClient;
+PubSubClient mqttClient(ethClient);
+
+// --- MQTT Periodic Status Variables ---
+unsigned long lastStatusPublishTime = 0;
+const unsigned long STATUS_PUBLISH_INTERVAL_MS = 60 * 1000; // 60 seconds
+
+
+// --- RS-485 Protocol Defines (Master requests & Slave responses) ---
+// Master (ESP32) -> Slave (ATtiny) Requests
+#define MASTER_POLL_START_BYTE   0xBB
+#define MASTER_ID                0x00 // ESP32's own ID on the bus
+#define REQ_STATUS_POLL          0x01 // Request for button status data
+#define REQ_DISCOVERY_POLL       0x02 // Request for device presence/ACK
+
+// Slave (ATtiny) -> Master (ESP32) Responses
+#define RESP_STATUS_DATA         0xAA // Start byte for status data response
+#define RESP_DISCOVERY_ACK       0xCC // Start byte for discovery ACK response
+
+// Packet Lengths
+#define MASTER_REQUEST_PACKET_LENGTH 5 // StartByte + MasterID + RequestType + TargetID + Checksum
+#define SLAVE_STATUS_RESPONSE_LENGTH 5 // StartByte + DeviceID + RawMCPHigh + RawMCPLow + Checksum
+#define SLAVE_ACK_RESPONSE_LENGTH    4 // StartByte + DeviceID + AckType + Checksum
+
+
+// --- Button Timing and Debounce (Processed on ESP32) ---
+const unsigned long DEBOUNCE_DELAY = 50;      // milliseconds
+const unsigned long LONG_PRESS_THRESHOLD = 200; // milliseconds
+
+// --- Button Logical States (Internal to ESP32 for JSON output) ---
+enum ButtonLogicalStateMain {
+    MAIN_OFF,       // Button is released
+    MAIN_PRESSED,   // Button is momentarily pressed (before LONGPRESS_TRIGGERED)
+    MAIN_HELD       // Button has fired LONGPRESS_TRIGGERED and is still pressed
+};
+const char* btnStateStrings[] = { // Mapping for JSON
+    "OFF",
+    "PRESSED", // For MAIN_PRESSED
+    "HELD"     // For MAIN_HELD
+};
+
+// --- Data Structure for Each Button's State Machine on ESP32 ---
+struct ButtonStatusESP32 {
+    ButtonLogicalStateMain state;
+    unsigned long pressStartTime;   // millis() when the button initially went physically pressed (LOW)
+    unsigned long lastPhysicalChange; // millis() of the last raw physical state change (for debouncing)
+    bool longPressEventSent;        // Flag to ensure LONG_PRESS_TRIGGERED event is sent only once
+};
+// Global state table for all 12 buttons across 16 possible device IDs
+ButtonStatusESP32 allDeviceButtonStates[16][12]; // allDeviceButtonStates[deviceID][buttonIndex]
+
+// --- Raw MCP Input Storage (to detect changes and run state machines) ---
+uint16_t lastRawMCPInputs[16]; // Stores the last raw 16-bit input for each device ID
+
+
+// --- Polling Management ---
+enum PollingState { DISCOVERY_MODE, NORMAL_MODE }; // PAUSE_MODE removed
+PollingState currentPollingState = DISCOVERY_MODE;
+
+bool discoveredDevices[16]; // Track if a device ID has been discovered (true/false)
+unsigned long lastSeenTimestamp[16]; // millis() of last successful communication with each device
+
+int currentPollingTargetID = 0; // The device ID currently being targeted for a poll
+
+// New timing constants based on user's clarification
+const unsigned long POLL_SLOT_DURATION_MS = 20; // Master polls for 20ms max per device (user's refined 'slot time')
+const unsigned long NOMINAL_SINGLE_POLL_TRANSACTION_MS = 10; // Minimum time for one Master-Slave transaction (send+receive+turnaround)
+
+const unsigned long JITTER_BUFFER_MS = 200; // General safety buffer for timeouts
+const unsigned long MINIMUM_CALCULATED_TIMEOUT_MS = 250; // Minimum timeout even if only 1 device
+
+unsigned long lastDiscoveryRescanTime = 0;
+const unsigned long FULL_DISCOVERY_RESCAN_INTERVAL_MS = 60 * 1000; // Rescan all 16 IDs every 60 seconds
+
+// This flag tracks if a response for the currently active poll slot has been received.
+// Used for the "immediate hop" optimization.
+static bool responseReceivedForCurrentSlot = false; 
+
+// This variable stores the ID of the device that was *just* polled in the previous slot.
+// Used for applying timeout checks.
+static int lastPolledIDForTimeoutCheck = -1; 
+
+// Timestamp when the last poll request was sent. Used for 'slot' timing.
+unsigned long lastPollRequestSentTime = 0;
+
+
+// --- RS-485 Receive Buffer (Master) ---
+byte rs485_recv_buffer[SLAVE_STATUS_RESPONSE_LENGTH]; // Use max possible slave response length
+byte rs485_recv_index = 0;
+bool rs485_packet_started = false;
+
+
+// --- Function Prototypes ---
+void ETH_GotIP(arduino_event_id_t event, arduino_event_info_t info);
+void ETH_Stop(arduino_event_id_t event, arduino_event_info_t info);
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void reconnectMQTT();
+void publishIPStatus();
+void publishDeviceStatus(byte deviceID, const char* status);
+
+// RS-485 Polling Functions
+void sendPollRequest(byte requestType, byte targetDeviceID);
+void processIncomingRS485Data();
+void processSlaveStatusResponse(byte deviceID, uint16_t rawMCPInputs);
+void processSlaveDiscoveryAck(byte deviceID);
+void runButtonStateMachine(byte deviceID, byte buttonIndex, bool currentPhysicalPressed);
+void publishButtonState(byte deviceID);
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  while (!Serial && millis() < 5000) {
+    // Wait for serial monitor or 5 seconds
+  }
+
+  Serial.println("\n--- ESP32-ETH01 System Start (Full Protocol) ---");
+
+  // --- Set Device Hostname ---
+  WiFi.setHostname(MQTT_CLIENT_ID);
+  Serial.printf("Setting hostname to: %s\n", MQTT_CLIENT_ID);
+
+  // --- Disable Wi-Fi to dedicate resources to Ethernet ---
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
+
+  // --- Register Ethernet event handlers BEFORE ETH.begin() ---
+  Serial.println("Registering Ethernet event handlers...");
+  WiFi.onEvent(ETH_GotIP, ARDUINO_EVENT_ETH_GOT_IP);
+  WiFi.onEvent(ETH_Stop, ARDUINO_EVENT_ETH_STOP);
+
+  // --- Setup MQTT Client ---
+  Serial.println("Configuring MQTT client...");
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+
+  // --- Setup RS-485 UART ---
+  SerialRS485.begin(RS485_BAUD_RATE, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
+  pinMode(RS485_DE_PIN, OUTPUT);
+  pinMode(RS485_NRE_PIN, OUTPUT);
+  digitalWrite(RS485_DE_PIN, LOW);
+  digitalWrite(RS485_NRE_PIN, LOW);
+  Serial.print("RS-485 initialized on RX:"); Serial.print(RS485_RX_PIN);
+  Serial.print("/TX:"); Serial.print(RS485_TX_PIN);
+  Serial.print("/DE:"); Serial.print(RS485_DE_PIN);
+  Serial.print("/~RE:"); Serial.print(RS485_NRE_PIN);
+  Serial.print(" at "); Serial.print(RS485_BAUD_RATE); Serial.println(" bps.");
+
+
+  // --- Initialize RS-485 Polling State ---
+  for (int i = 0; i < 16; i++) {
+    discoveredDevices[i] = false;
+    lastSeenTimestamp[i] = 0;
+    lastRawMCPInputs[i] = 0xFFFF;
+    for (int j = 0; j < 12; j++) {
+      allDeviceButtonStates[i][j].state = MAIN_OFF;
+      allDeviceButtonStates[i][j].pressStartTime = 0;
+      allDeviceButtonStates[i][j].lastPhysicalChange = 0;
+      allDeviceButtonStates[i][j].longPressEventSent = false;
+    }
+  }
+  currentPollingState = DISCOVERY_MODE; // Start in discovery mode
+  currentPollingTargetID = 0; // Start discovery from ID 0
+  lastPollRequestSentTime = millis(); // Initialize polling timing
+
+
+  // --- Configure and Start Ethernet (moved to end of setup) ---
+  Serial.println("Starting Ethernet connection now (after all handlers and MQTT client setup)...");
+  ETH.begin(1, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN, ETH_TYPE, ETH_CLK_MODE, true);
+  Serial.println("ETH.begin() called with user-specified signature.");
+
+
+  Serial.println("--- Setup Complete. Waiting for IP address and MQTT ---");
+}
+
+
+void loop() {
+  // --- MQTT Client Loop ---
+  if (ethGotIP) {
+    if (!mqttClient.connected()) {
+      reconnectMQTT();
+    }
+    mqttClient.loop();
+
+    if (mqttClient.connected() && (millis() - lastStatusPublishTime >= STATUS_PUBLISH_INTERVAL_MS)) {
+      publishIPStatus();
+      lastStatusPublishTime = millis();
+    }
+  } else {
+    static unsigned long lastNetworkStatusPrintTime = 0;
+    if (millis() - lastNetworkStatusPrintTime >= 5000) {
+        Serial.println("ESP32: Waiting for Ethernet IP...");
+        lastNetworkStatusPrintTime = millis();
+    }
+  }
+
+  // --- RS-485 Master Polling Logic ---
+  // Process any incoming RS-485 data first
+  processIncomingRS485Data();
+
+  // Calculate numActiveDevicesInCycle for timeout calculation
+  unsigned long numActiveDevicesInCycle = 0;
+  for (int i = 0; i < 16; i++) {
+      if (discoveredDevices[i]) {
+          numActiveDevicesInCycle++;
+      }
+  }
+  // During discovery mode or if no devices are discovered yet, assume max devices (16) for cycle time
+  if (currentPollingState == DISCOVERY_MODE || numActiveDevicesInCycle == 0) {
+      numActiveDevicesInCycle = 16; 
+  }
+
+  // Calculate current effective timeout based on the specified slot-based polling
+  // Timeout = (Number of devices in cycle * Slot Duration) + Jitter Buffer
+  unsigned long calculatedDynamicTimeout = numActiveDevicesInCycle * POLL_SLOT_DURATION_MS + JITTER_BUFFER_MS;
+  // Ensure timeout is not too short even with very few devices
+  if (calculatedDynamicTimeout < MINIMUM_CALCULATED_TIMEOUT_MS) {
+      calculatedDynamicTimeout = MINIMUM_CALCULATED_TIMEOUT_MS;
+  }
+  // Serial.printf("DEBUG: Current calculated timeout: %lu ms (based on %lu active devices)\n", currentCalculatedTimeout, numActiveDevicesInCycle);
+
+
+  // --- Device Timeout Check (for the device that was polled in the *previous* slot) ---
+  // This check applies if we are in NORMAL_MODE and a device was actually polled before.
+  if (currentPollingState == NORMAL_MODE && lastPolledIDForTimeoutCheck != -1 && discoveredDevices[lastPolledIDForTimeoutCheck]) {
+      if (millis() - lastSeenTimestamp[lastPolledIDForTimeoutCheck] > calculatedDynamicTimeout) {
+          Serial.printf("Device ID %d timed out (no response) after %lu ms! (Calculated timeout was: %lu ms)\n", lastPolledIDForTimeoutCheck, millis() - lastSeenTimestamp[lastPolledIDForTimeoutCheck], calculatedDynamicTimeout);
+          discoveredDevices[lastPolledIDForTimeoutCheck] = false; // Mark as disconnected
+          publishDeviceStatus(lastPolledIDForTimeoutCheck, "disconnected");
+      }
+  }
+
+
+  // --- Polling State Machine (with "immediate hop" optimization) ---
+  // A poll is sent if:
+  // 1. The full POLL_SLOT_DURATION_MS has passed since the last poll was sent. (Max wait)
+  // OR
+  // 2. The response for the *current* poll has already been received (responseReceivedForCurrentSlot is true),
+  //    AND a minimal time for the transaction has passed (NOMINAL_SINGLE_POLL_TRANSACTION_MS)
+  if ( (millis() - lastPollRequestSentTime >= POLL_SLOT_DURATION_MS) || 
+       (responseReceivedForCurrentSlot && (millis() - lastPollRequestSentTime >= NOMINAL_SINGLE_POLL_TRANSACTION_MS)) 
+     )
+  {
+    responseReceivedForCurrentSlot = false; // Reset for the next poll
+    
+    // --- Determine next device to poll ---
+    if (currentPollingState == DISCOVERY_MODE) {
+      if (currentPollingTargetID < 16) {
+        sendPollRequest(REQ_DISCOVERY_POLL, currentPollingTargetID);
+        lastPolledIDForTimeoutCheck = currentPollingTargetID; // Store ID for timeout check
+        currentPollingTargetID++;
+        lastPollRequestSentTime = millis(); // Update time when this poll was sent
+      } else { // Finished one full discovery scan (0-15)
+        Serial.println("Finished discovery scan.");
+        currentPollingState = NORMAL_MODE; // Transition to normal operating mode
+        currentPollingTargetID = 0; // Reset for next normal polling cycle (start from ID 0)
+        lastDiscoveryRescanTime = millis(); // Reset full rescan timer
+        // The delay until the next poll is implicitly handled by the top-level 'if' condition.
+      }
+    } else { // NORMAL_MODE
+      // Periodically re-enter DISCOVERY_MODE for a full rescan
+      if (millis() - lastDiscoveryRescanTime >= FULL_DISCOVERY_RESCAN_INTERVAL_MS) {
+          Serial.println("Starting full discovery rescan...");
+          currentPollingState = DISCOVERY_MODE;
+          currentPollingTargetID = 0;
+          lastPollRequestSentTime = millis(); // Reset for discovery polling
+          // lastDiscoveryRescanTime will be reset when discovery scan is complete or at end of NORMAL cycle
+          return; // Skip normal polling for this loop iteration
+      }
+
+      bool foundNext = false;
+      // Loop to find the next active device to poll, starting from currentPollingTargetID
+      for (int i = 0; i < 16; i++) {
+          int id = (currentPollingTargetID + i) % 16; // Start from current position and wrap around
+          if (discoveredDevices[id]) { // If this device ID is marked as discovered
+              currentPollingTargetID = id; // Set this as our new target for this poll
+              foundNext = true;
+              break;
+          }
+      }
+
+      if (foundNext) {
+          sendPollRequest(REQ_STATUS_POLL, currentPollingTargetID);
+          lastPolledIDForTimeoutCheck = currentPollingTargetID; // Store for timeout check
+          currentPollingTargetID = (currentPollingTargetID + 1) % 16; // Move to the next for the next iteration (wrap if needed)
+          lastPollRequestSentTime = millis(); // Update time when this poll was sent
+      } else {
+          // No active devices found in the NORMAL_MODE list.
+          // This implies all previously discovered devices are now disconnected or none were ever found.
+          Serial.println("No active devices found. Forcing next discovery scan.");
+          currentPollingState = DISCOVERY_MODE; // Force rediscovery
+          currentPollingTargetID = 0;
+          lastPollRequestSentTime = millis(); // Reset for discovery polling
+          lastDiscoveryRescanTime = millis(); // Reset rescan timer immediately
+      }
+    }
+  }
+}
+
+
+// --- Ethernet Event Handlers ---
+
+void ETH_GotIP(arduino_event_id_t event, arduino_event_info_t info) {
+  Serial.printf("Ethernet link UP, DHCP successful, IP: %s\n", IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+  Serial.printf("MAC: %s\n", ETH.macAddress().c_str());
+  Serial.printf("Hostname: %s\n", WiFi.getHostname());
+  ethGotIP = true;
+  Serial.println("ETH: IP obtained. Attempting immediate MQTT reconnect.");
+  reconnectMQTT();
+  mqttClient.publish(MQTT_LWT_TOPIC, "Online", true);
+  publishIPStatus();
+}
+
+void ETH_Stop(arduino_event_id_t event, arduino_event_info_t info) {
+  Serial.println("Ethernet link DOWN or IP lost!");
+  ethGotIP = false;
+  if (mqttClient.connected()) {
+      mqttClient.disconnect();
+      Serial.println("MQTT client disconnected due to ETH DOWN.");
+  }
+  mqttClient.publish(MQTT_LWT_TOPIC, MQTT_LWT_MESSAGE_OFFLINE, true);
+}
+
+
+// --- MQTT Callbacks and Functions ---
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("MQTT RX: Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+  String messagePayload = "";
+  for (int i = 0; i < length; i++) {
+    messagePayload += (char)payload[i];
+  }
+  Serial.println(messagePayload);
+
+  if (String(topic) == MQTT_CMD_RESTART_TOPIC) {
+    if (messagePayload == "1") {
+      Serial.println("MQTT RX: Received RESTART command. Restarting ESP32...");
+      mqttClient.publish(MQTT_LWT_TOPIC, "Restarting", true);
+      delay(100);
+      ESP.restart();
+    }
+  }
+}
+
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("MQTT: Attempting connection to "); Serial.print(MQTT_HOST); Serial.print("...");
+    if (mqttClient.connect(MQTT_CLIENT_ID, NULL, NULL, MQTT_LWT_TOPIC, 0, true, MQTT_LWT_MESSAGE_OFFLINE)) {
+      Serial.println("connected!");
+      mqttClient.publish(MQTT_LWT_TOPIC, "Online", true);
+      mqttClient.subscribe(MQTT_CMD_RESTART_TOPIC);
+      Serial.printf("MQTT: Subscribed to %s\n", MQTT_CMD_RESTART_TOPIC);
+      publishIPStatus();
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retrying in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void publishIPStatus() {
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT: Not connected, cannot publish IP status.");
+    return;
+  }
+
+  if (!ethGotIP) {
+      Serial.println("MQTT: Ethernet not up, cannot publish IP status.");
+      return;
+  }
+
+  StaticJsonDocument<256> doc;
+
+  doc["ip_address"] = ETH.localIP().toString();
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  Serial.printf("MQTT: Publishing IP status to %s: %s\n", MQTT_STATUS_TOPIC, jsonString.c_str());
+  mqttClient.publish(MQTT_STATUS_TOPIC, jsonString.c_str());
+}
+
+void publishDeviceStatus(byte deviceID, const char* status) {
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT: Not connected, cannot publish device status.");
+    return;
+  }
+  StaticJsonDocument<256> doc;
+  doc["device_id"] = deviceID;
+  doc["status"] = status;
+  String jsonString;
+  serializeJson(doc, jsonString);
+  mqttClient.publish(MQTT_STATUS_TOPIC, jsonString.c_str());
+  Serial.printf("Published Device Status: ID %d, Status: %s\n", deviceID, status);
+}
+
+
+// --- RS-485 Polling Functions (Master) ---
+
+// This function sends a poll request to a target slave device.
+void sendPollRequest(byte requestType, byte targetDeviceID) {
+  // Clear RX buffer before sending to avoid old data
+  while (SerialRS485.available()) {
+    SerialRS485.read();
+  }
+
+  byte checksum = MASTER_POLL_START_BYTE ^ MASTER_ID ^ requestType ^ targetDeviceID;
+
+  // Set ST3485DE to Transmit Mode: DE HIGH, ~RE HIGH
+  digitalWrite(RS485_NRE_PIN, HIGH); // Disable Receiver (~RE LOW to HIGH)
+  digitalWrite(RS485_DE_PIN, HIGH);  // Enable Driver (DE LOW to HIGH)
+  delay(1); // Short delay for transceiver to switch modes
+
+  SerialRS485.write(MASTER_POLL_START_BYTE);
+  SerialRS485.write(MASTER_ID);
+  SerialRS485.write(requestType);
+  SerialRS485.write(targetDeviceID);
+  SerialRS485.write(checksum);
+  SerialRS485.flush(); // Wait for transmit buffer to empty
+
+  // Set ST3485DE back to Receive Mode: DE LOW, ~RE LOW
+  digitalWrite(RS485_DE_PIN, LOW);
+  digitalWrite(RS485_NRE_PIN, LOW);
+  
+  // lastPollRequestSentTime is updated in loop() after this call
+}
+
+// This function processes any incoming RS-485 data from slaves.
+void processIncomingRS485Data() {
+    // Keep processing bytes as long as they are available in the receive buffer
+    while (SerialRS485.available()) {
+        byte incomingByte = SerialRS485.read();
+
+        // If not started, check if current byte is a start byte
+        if (!rs485_packet_started) {
+            if (incomingByte == RESP_STATUS_DATA || incomingByte == RESP_DISCOVERY_ACK) {
+                rs485_packet_started = true;
+                rs485_recv_buffer[0] = incomingByte;
+                rs485_recv_index = 1; // Start storing from index 1
+            }
+            continue; // Go to next byte
+        }
+
+        // If started, store the byte
+        rs485_recv_buffer[rs485_recv_index++] = incomingByte;
+
+        // Check for full packet received based on the detected start byte
+        if (rs485_recv_buffer[0] == RESP_STATUS_DATA) {
+            if (rs485_recv_index >= SLAVE_STATUS_RESPONSE_LENGTH) {
+                // Full Status Packet Received
+                byte receivedID = rs485_recv_buffer[1];
+                uint16_t rawMCPHigh = rs485_recv_buffer[2];
+                uint16_t rawMCPLow = rs485_recv_buffer[3];
+                uint16_t rawMCPInputs = (rawMCPHigh << 8) | rawMCPLow;
+                byte receivedChecksum = rs485_recv_buffer[4];
+
+                byte calculatedChecksum = RESP_STATUS_DATA ^ receivedID ^ rawMCPHigh ^ rawMCPLow;
+
+                if (calculatedChecksum == receivedChecksum) {
+                    processSlaveStatusResponse(receivedID, rawMCPInputs);
+                    // Crucial: A successful response means we can "hop" immediately.
+                    responseReceivedForCurrentSlot = true;
+                } else {
+                    Serial.println("RS-485 STATUS Checksum Mismatch!");
+                }
+                // Reset receiver state for next packet
+                rs485_recv_index = 0;
+                rs485_packet_started = false;
+            }
+        } else if (rs485_recv_buffer[0] == RESP_DISCOVERY_ACK) {
+            if (rs485_recv_index >= SLAVE_ACK_RESPONSE_LENGTH) {
+                // Full Discovery ACK Packet Received
+                byte receivedID = rs485_recv_buffer[1];
+                byte ackType = rs485_recv_buffer[2];
+                byte receivedChecksum = rs485_recv_buffer[3];
+
+                byte calculatedChecksum = RESP_DISCOVERY_ACK ^ receivedID ^ ackType;
+                if (calculatedChecksum == receivedChecksum) {
+                    processSlaveDiscoveryAck(receivedID);
+                    // Crucial: A successful response means we can "hop" immediately.
+                    responseReceivedForCurrentSlot = true;
+                } else {
+                    Serial.println("RS-485 ACK Checksum Mismatch!");
+                }
+                // Reset receiver state for next packet
+                rs485_recv_index = 0;
+                rs485_packet_started = false;
+            }
+        }
+    }
+}
+
+// Handles processing of a received status data packet
+void processSlaveStatusResponse(byte deviceID, uint16_t currentRawMCPInputs) {
+  // Validate deviceID
+  if (deviceID >= 16) {
+    Serial.printf("Invalid DeviceID (%d) received in status response.\n", deviceID);
+    return;
+  }
+
+  // If this device was previously marked as disconnected, publish "connected"
+  if (!discoveredDevices[deviceID]) {
+      discoveredDevices[deviceID] = true;
+      publishDeviceStatus(deviceID, "connected");
+  }
+  lastSeenTimestamp[deviceID] = millis(); // Update last seen time for this device
+
+  // Extract relevant 12 button bits from the 16-bit raw input
+  uint16_t currentButtonInputs = (currentRawMCPInputs & 0x00FF) | ((currentRawMCPInputs >> 4) & 0x0F00);
+  uint16_t previousButtonInputs = (lastRawMCPInputs[deviceID] & 0x00FF) | ((lastRawMCPInputs[deviceID] >> 4) & 0x0F00);
+
+  // Run button state machine for each of the 12 buttons
+  bool deviceStateChanged = false; // Flag to decide if we should publish this device's states
+
+  for (int i = 0; i < 12; i++) {
+    bool currentPhysicalPressed = !bitRead(currentButtonInputs, i); // Buttons are active-low
+    bool previousPhysicalPressed = !bitRead(previousButtonInputs, i);
+
+    // --- Step 1: Detect raw physical changes and update debounce timer ---
+    if (currentPhysicalPressed != previousPhysicalPressed) {
+      allDeviceButtonStates[deviceID][i].lastPhysicalChange = millis();
+    }
+
+    // --- Step 2: Apply debounce logic ---
+    if (millis() - allDeviceButtonStates[deviceID][i].lastPhysicalChange < DEBOUNCE_DELAY) {
+      continue; // Still in debounce period, ignore this button for now
+    }
+
+    // --- Step 3: Button State Machine Transitions ---
+    switch (allDeviceButtonStates[deviceID][i].state) {
+      case MAIN_OFF:
+        if (currentPhysicalPressed) {
+          allDeviceButtonStates[deviceID][i].state = MAIN_PRESSED;
+          allDeviceButtonStates[deviceID][i].pressStartTime = millis();
+          allDeviceButtonStates[deviceID][i].longPressEventSent = false;
+          deviceStateChanged = true; // State changed, flag for publish
+        }
+        break;
+
+      case MAIN_PRESSED:
+        if (!currentPhysicalPressed) { // Button released before LONG_PRESS_THRESHOLD
+          allDeviceButtonStates[deviceID][i].state = MAIN_OFF;
+          deviceStateChanged = true; // State changed, flag for publish
+        } else if (millis() - allDeviceButtonStates[deviceID][i].pressStartTime >= LONG_PRESS_THRESHOLD) {
+          // Button held long enough for LONG_PRESS_TRIGGERED
+          allDeviceButtonStates[deviceID][i].state = MAIN_HELD;
+          allDeviceButtonStates[deviceID][i].longPressEventSent = true;
+          deviceStateChanged = true; // State changed, flag for publish
+        }
+        break;
+
+      case MAIN_HELD:
+        if (!currentPhysicalPressed) { // Button released after LONG_PRESS_THRESHOLD
+          allDeviceButtonStates[deviceID][i].state = MAIN_OFF;
+          deviceStateChanged = true; // State changed, flag for publish
+        }
+        break;
+    }
+  }
+
+  // Update last raw inputs for this device for next comparison
+  lastRawMCPInputs[deviceID] = currentRawMCPInputs;
+
+  // If any button's logical state changed for this device, publish the updated state
+  if (deviceStateChanged) {
+    publishButtonState(deviceID);
+  }
+}
+
+// Handles processing of a received discovery ACK packet
+void processSlaveDiscoveryAck(byte deviceID) {
+    // Validate deviceID
+    if (deviceID >= 16) {
+        Serial.printf("Invalid DeviceID (%d) received in ACK response.\n", deviceID);
+        return;
+    }
+    // Serial.printf("Received DISCOVERY ACK from ID %d\n", deviceID); // Uncomment for verbose
+
+    // If this device was previously marked as disconnected, publish "connected"
+    if (!discoveredDevices[deviceID]) {
+        discoveredDevices[deviceID] = true;
+        publishDeviceStatus(deviceID, "connected");
+    }
+    lastSeenTimestamp[deviceID] = millis(); // Update last seen time for this device
+}
+
+// Publishes current button states of a device as JSON
+void publishButtonState(byte deviceID) {
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT: Not connected, cannot publish button state.");
+    return;
+  }
+
+  if (!ethGotIP) {
+      Serial.println("MQTT: Ethernet not up, cannot publish button state.");
+      return;
+  }
+
+  StaticJsonDocument<256> doc; // Capacity for {"device_id":N, "btn1":"STATE", ...}
+
+  doc["device_id"] = deviceID;
+
+  for (int i = 0; i < 12; i++) { // Iterate only through the 12 relevant buttons
+    String btnKey = "btn" + String(i + 1); // btn1, btn2, ..., btn12
+    doc[btnKey] = btnStateStrings[allDeviceButtonStates[deviceID][i].state];
+  }
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  // Publish to specific topic for button events (e.g., sensors/buttons/events)
+  Serial.printf("MQTT: Publishing button state to %s: %s\n", MQTT_DATA_TOPIC, jsonString.c_str());
+  mqttClient.publish(MQTT_DATA_TOPIC, jsonString.c_str());
+}
